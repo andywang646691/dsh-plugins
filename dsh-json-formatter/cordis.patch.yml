@@ -1,0 +1,4 @@
+# @max/dsh-json-formatter bundle patch
+- insert:
+    - id: dsh-json-formatter
+      name: '@max/dsh-json-formatter'

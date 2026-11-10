@@ -1,0 +1,42 @@
+{
+  "name": "@max/dsh-json-formatter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "JSON Formatter and Tree Inspector plugin for DeepSeek Harness Better Sidebar",
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./logo": "./logo.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "betterSidebar",
+        "@deepseek-ai/dsh-client-modules"
+      ]
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --input-type=module -e 'import(\"./index.mjs\"); console.log(\"✔ @max/dsh-json-formatter syntax valid\")'"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "dsh-better-sidebar": "^0.30.1"
+  },
+  "peerDependenciesMeta": {
+    "dsh-better-sidebar": {
+      "optional": true
+    }
+  }
+}
