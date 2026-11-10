@@ -368,47 +368,46 @@ export class FastSessionIndex {
 
   async syncRecent(sq, signal) {
     if (!existsSync(this.sessionsBaseDir)) return 0;
-    const db = await this.open();
-    let maxFoundMtime = this.lastCheckpointMtime;
-    const dirtySessions = [];
-
+    if (this.syncing) return 0;
+    this.syncing = true;
     try {
-      const workspaces = readdirSync(this.sessionsBaseDir);
-      for (const ws of workspaces) {
-        const wsDir = join(this.sessionsBaseDir, ws);
-        if (!statSync(wsDir).isDirectory()) continue;
-        const sessions = readdirSync(wsDir);
-        for (const s of sessions) {
-          const sDir = join(wsDir, s);
-          try {
-            const st = statSync(sDir);
-            if (st.mtimeMs > this.lastCheckpointMtime) {
-              dirtySessions.push({ id: s, dir: sDir, mtime: Math.floor(st.mtimeMs) });
-              if (st.mtimeMs > maxFoundMtime) maxFoundMtime = st.mtimeMs;
-            }
-          } catch {}
-        }
-      }
-    } catch (e) {
-      this.log(`Scan dirty sessions error: ${e?.message || e}`);
-    }
+      const db = await this.open();
+      let maxFoundMtime = this.lastCheckpointMtime;
+      const dirtySessions = [];
 
-    if (!dirtySessions.length) return 0;
-
-    let indexedCount = 0;
-    for (const item of dirtySessions) {
-      if (signal?.aborted) break;
       try {
-        let snap = null;
-        if (sq) {
-          try { snap = await sq.readSession(item.id); } catch {}
+        const workspaces = readdirSync(this.sessionsBaseDir);
+        for (const ws of workspaces) {
+          const wsDir = join(this.sessionsBaseDir, ws);
+          if (!statSync(wsDir).isDirectory()) continue;
+          const sessions = readdirSync(wsDir);
+          for (const s of sessions) {
+            const sDir = join(wsDir, s);
+            try {
+              const logFile = join(sDir, 'session.v4.jsonl.zstd');
+              let targetMtime = 0;
+              if (existsSync(logFile)) {
+                targetMtime = statSync(logFile).mtimeMs;
+              } else {
+                targetMtime = statSync(sDir).mtimeMs;
+              }
+              if (targetMtime > this.lastCheckpointMtime) {
+                dirtySessions.push({ id: s, dir: sDir, mtime: Math.floor(targetMtime) });
+                if (targetMtime > maxFoundMtime) maxFoundMtime = targetMtime;
+              }
+            } catch {}
+          }
         }
+      } catch (e) {
+        this.log(`Scan dirty sessions error: ${e?.message || e}`);
+      }
 
-        if (snap?.events) {
-          let title;
-          try { title = (await sq.readTitle(item.id, signal))?.title; } catch {}
-          indexedCount += await this.ingestSession(item.id, snap.session, snap.events, title, item.mtime);
-        } else {
+      if (!dirtySessions.length) return 0;
+
+      let indexedCount = 0;
+      for (const item of dirtySessions) {
+        if (signal?.aborted) break;
+        try {
           const logFile = join(item.dir, 'session.v4.jsonl.zstd');
           if (existsSync(logFile)) {
             const jsonlText = decompressZstdLog(readFileSync(logFile));
@@ -428,13 +427,17 @@ export class FastSessionIndex {
               indexedCount += await this.ingestSession(item.id, header, events, title, item.mtime);
             }
           }
+        } catch (e) {
+          this.log(`Ingest session ${item.id} error: ${e?.message || e}`);
         }
-      } catch (e) {}
-    }
+      }
 
-    this.lastCheckpointMtime = maxFoundMtime;
-    db.prepare("INSERT INTO sync_meta(key, val) VALUES('last_mtime', ?) ON CONFLICT(key) DO UPDATE SET val=excluded.val").run(String(Math.floor(maxFoundMtime)));
-    return indexedCount;
+      this.lastCheckpointMtime = maxFoundMtime;
+      db.prepare("INSERT INTO sync_meta(key, val) VALUES('last_mtime', ?) ON CONFLICT(key) DO UPDATE SET val=excluded.val").run(String(Math.floor(maxFoundMtime)));
+      return indexedCount;
+    } finally {
+      this.syncing = false;
+    }
   }
 
   async search(query, { limit = 20, excludeSessionId, after, before, sort } = {}) {
@@ -569,11 +572,25 @@ export function apply(ctx, rawConfig = {}) {
 
   const index = new FastSessionIndex(dbPath, log);
 
+  let syncDebounceTimer = null;
+  const triggerBackgroundSync = () => {
+    if (syncDebounceTimer) return;
+    syncDebounceTimer = setTimeout(async () => {
+      syncDebounceTimer = null;
+      try {
+        await index.syncRecent();
+      } catch (e) {
+        log(`Background sync error: ${e?.message || e}`);
+      }
+    }, 1000);
+    syncDebounceTimer.unref?.();
+  };
+
   // Startup GC & initial sync
   setTimeout(async () => {
     try {
       await index.runStartupGc();
-      await index.syncRecent(ctx.get('sessionQuery'));
+      await index.syncRecent();
     } catch (e) {
       log(`Startup sync error: ${e?.message || e}`);
     }
@@ -582,16 +599,18 @@ export function apply(ctx, rawConfig = {}) {
   // Attach to sessionQuery for native Web GUI sidebar & menu search
   const attachToSessionQuery = (service) => {
     if (!service) return;
-    service.searchSessions = async (request, execContext) => {
+    const fastSearchHandler = async (request, execContext) => {
       const query = request?.query || '';
       if (!query.trim()) return { items: [] };
 
-      try {
-        await index.syncRecent(service, execContext?.signal);
-      } catch {}
+      // Trigger non-blocking background sync so index stays fresh
+      triggerBackgroundSync();
 
       const limit = request?.limit ?? 20;
+      const t0 = Date.now();
       const hits = await index.search(query, { limit });
+      const elapsed = Date.now() - t0;
+      log(`searchSessions: query="${query}" -> ${hits.length} hits (${elapsed}ms)`);
 
       return {
         items: hits.map((h) => ({
@@ -599,9 +618,14 @@ export function apply(ctx, rawConfig = {}) {
             id: h.session_id,
             title: h.title,
             cwd: h.cwd,
+            createdAt: h.created || h.time,
           },
+          live: false,
+          persisted: true,
           bestMatch: {
             sessionId: h.session_id,
+            seq: h.seq,
+            time: h.time,
             surface: 'current',
             type: h.role === 'user' ? 'user/message' : 'assistant/message',
             snippet: h.snippet || clip(h.text, 240),
@@ -610,6 +634,14 @@ export function apply(ctx, rawConfig = {}) {
         nextCursor: undefined,
       };
     };
+
+    service.searchSessions = fastSearchHandler;
+    try {
+      const proto = Object.getPrototypeOf(service);
+      if (proto && proto !== Object.prototype) {
+        proto.searchSessions = fastSearchHandler;
+      }
+    } catch {}
     log('Fast search successfully hooked into ctx.sessionQuery.searchSessions');
   };
 
