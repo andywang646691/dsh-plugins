@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { SessionIndex, extractMessages, registerSessionSearch, cleanJson } from '../lib/session-search.js';
 import { ReviewController, REVIEW_MAX_ITERATIONS } from '../lib/review.js';
 
@@ -309,4 +312,131 @@ test('session_search produces lossless JSON for all shapes (zero undefined prope
   assert.equal(discoRes.shape, 'discovery');
   const discoSnap = snapshotJsonValue(discoRes);
   assert.ok(discoSnap !== undefined, 'discovery result must be losslessly JSON-serializable');
+});
+
+test('SessionIndex auto-migrates legacy 2.0.0-bigram FTS5 schema without losing messages', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-search-mig-'));
+  const dbPath = join(dir, 'sessions.sqlite');
+  try {
+    // Seed a legacy 2.0.0-bigram database matching the broken production layout
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec(`
+      CREATE TABLE sync_meta(key TEXT PRIMARY KEY, val TEXT);
+      INSERT INTO sync_meta VALUES ('schema_version', '2.0.0-bigram');
+      CREATE TABLE sessions(id TEXT PRIMARY KEY, cwd TEXT, created INTEGER, mtime INTEGER, title TEXT, indexed_through INTEGER, origin TEXT);
+      CREATE TABLE messages(rowid INTEGER PRIMARY KEY, session_id TEXT, seq INTEGER, time INTEGER, role TEXT, text TEXT, UNIQUE(session_id, seq));
+      CREATE VIRTUAL TABLE messages_fts USING fts5(session_id UNINDEXED, seq UNINDEXED, time UNINDEXED, role UNINDEXED, raw_text UNINDEXED, search_text, tokenize='unicode61');
+    `);
+    legacy.prepare("INSERT INTO sessions(id, cwd, created, mtime, title, indexed_through, origin) VALUES ('s-old', '/app', 1000, 1000, '旧会话', 2, NULL)").run();
+    legacy.prepare("INSERT INTO messages(session_id, seq, time, role, text) VALUES ('s-old', 1, 1000, 'user', '历史迁移关键词测试')").run();
+    legacy.exec(`CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text); END;`);
+    legacy.close();
+
+    const idx = new SessionIndex(dbPath);
+    const added = await idx.ingest('s-new', { createdAt: 2000, cwd: '/app' }, [
+      user(1, '新会话插入验证'),
+      asst(2, '完成写入'),
+    ], '新会话');
+    assert.equal(added, 2);
+
+    const oldHits = await idx.search('迁移关键词');
+    assert.equal(oldHits.length, 1);
+    assert.equal(oldHits[0].session_id, 's-old');
+
+    const newHits = await idx.search('新会话插入');
+    assert.equal(newHits.length, 1);
+    assert.equal(newHits[0].session_id, 's-new');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('session_search skips full-corpus refresh on scroll/read and skips unchanged revisions', async () => {
+  let listCalls = 0;
+  let observeCalls = 0;
+  let revA = 'rev-a-1';
+  const sessionsData = {
+    'sess-a': {
+      header: { id: 'sess-a', createdAt: 1000, cwd: '/app' },
+      events: [user(1, '第一条消息alpha'), asst(2, '回复alpha')],
+    },
+    'sess-b': {
+      header: { id: 'sess-b', createdAt: 2000, cwd: '/app' },
+      events: [user(1, '第二条消息beta'), asst(2, '回复beta')],
+    },
+  };
+
+  let registeredTool = null;
+  const mockCtx = {
+    tools: { register: (t) => { registeredTool = t; return () => {}; } },
+    get: (name) => {
+      if (name === 'sessionPersistence') {
+        return {
+          list: async () => [
+            { header: sessionsData['sess-a'].header, revision: revA },
+            { header: sessionsData['sess-b'].header, revision: 'rev-b-1' },
+          ],
+          stat: async (id) => ({
+            header: sessionsData[id].header,
+            revision: id === 'sess-a' ? revA : 'rev-b-1',
+          }),
+        };
+      }
+      if (name === 'sessionQuery') {
+        return {
+          listSessions: async () => {
+            listCalls++;
+            return [
+              { header: sessionsData['sess-b'].header, live: false, persisted: true },
+              { header: sessionsData['sess-a'].header, live: false, persisted: true },
+            ];
+          },
+          observeSession: async (id) => {
+            observeCalls++;
+            const s = sessionsData[id];
+            return {
+              source: 'prepared',
+              header: s.header,
+              events: s.events,
+              cursor: s.events.at(-1).seq,
+              revision: id === 'sess-a' ? revA : 'rev-b-1',
+              [Symbol.dispose]: () => {},
+            };
+          },
+        };
+      }
+      return null;
+    },
+  };
+
+  registerSessionSearch(mockCtx, { indexPath: ':memory:', obeliskDbPath: null });
+  assert.ok(registeredTool);
+
+  // 1. Discovery runs initial full refresh (2 observes)
+  const d1 = await registeredTool.execute({ query: 'alpha' });
+  assert.equal(d1.results.length, 1);
+  assert.equal(listCalls, 1);
+  assert.equal(observeCalls, 2);
+
+  // 2. Second discovery skips both unchanged revisions (0 observes!)
+  const d2 = await registeredTool.execute({ query: 'beta' });
+  assert.equal(d2.results.length, 1);
+  assert.equal(listCalls, 2);
+  assert.equal(observeCalls, 2);
+
+  // 3. Scroll does NOT call listSessions() and skips unchanged stat revision (0 observes!)
+  const sc = await registeredTool.execute({ session_id: 'sess-a', around_message_id: '1', window: 2 });
+  assert.equal(sc.success, true);
+  assert.equal(listCalls, 2);
+  assert.equal(observeCalls, 2);
+
+  // 4. When sess-a changes on disk, scroll refreshes ONLY sess-a (1 observe, still 0 listCalls)
+  revA = 'rev-a-2';
+  sessionsData['sess-a'].events.push(user(3, '新增第三条gamma'));
+  const sc2 = await registeredTool.execute({ session_id: 'sess-a', around_message_id: '3', window: 2 });
+  assert.equal(sc2.success, true);
+  assert.ok(sc2.messages.some((m) => m.id === 3 && m.anchor === true));
+  assert.equal(listCalls, 2);
+  assert.equal(observeCalls, 3);
 });

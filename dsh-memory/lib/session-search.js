@@ -89,7 +89,8 @@ export class SessionIndex {
         created INTEGER,
         title TEXT,
         indexed_through INTEGER,
-        origin TEXT
+        origin TEXT,
+        revision TEXT
       );
       CREATE TABLE IF NOT EXISTS messages(
         rowid INTEGER PRIMARY KEY,
@@ -100,12 +101,55 @@ export class SessionIndex {
         text TEXT,
         UNIQUE(session_id, seq)
       );
-      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-        text,
-        content='messages',
-        content_rowid='rowid',
-        tokenize='trigram'
-      );
+    `);
+
+    const sessionCols = db.prepare('PRAGMA table_info(sessions)').all().map((c) => c.name);
+    if (!sessionCols.includes('revision')) {
+      db.exec('ALTER TABLE sessions ADD COLUMN revision TEXT');
+    }
+
+    // Detect missing or incompatible FTS5 schema (e.g. legacy 2.0.0-bigram without `text` column)
+    const ftsRow = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='messages_fts'")
+      .get();
+    const ftsCols = ftsRow
+      ? db.prepare('PRAGMA table_info(messages_fts)').all().map((c) => c.name)
+      : [];
+    const ftsCompatible =
+      Boolean(ftsRow) &&
+      ftsCols.length === 1 &&
+      ftsCols[0] === 'text' &&
+      String(ftsRow.sql || '').toLowerCase().includes('trigram');
+
+    if (!ftsCompatible) {
+      db.exec('BEGIN');
+      try {
+        db.exec(`
+          DROP TRIGGER IF EXISTS messages_ai;
+          DROP TRIGGER IF EXISTS messages_ad;
+          DROP TABLE IF EXISTS messages_fts;
+          CREATE VIRTUAL TABLE messages_fts USING fts5(
+            text,
+            content='messages',
+            content_rowid='rowid',
+            tokenize='trigram'
+          );
+          INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
+        `);
+        const hasSyncMeta = db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_meta'")
+          .get();
+        if (hasSyncMeta) {
+          db.prepare("INSERT OR REPLACE INTO sync_meta(key, val) VALUES ('schema_version', '3.0.0-trigram')").run();
+        }
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
+    }
+
+    db.exec(`
       CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
         INSERT INTO messages_fts(rowid, text) VALUES (new.rowid, new.text);
       END;
@@ -117,7 +161,7 @@ export class SessionIndex {
     return db;
   }
 
-  async ingest(sessionId, header, events, title) {
+  async ingest(sessionId, header, events, title, revision = null) {
     const db = await this.open();
     const row = db.prepare('SELECT indexed_through FROM sessions WHERE id=?').get(sessionId);
     const from = row?.indexed_through ?? -1;
@@ -128,18 +172,39 @@ export class SessionIndex {
       for (const m of msgs) ins.run(sessionId, m.seq, m.time ?? 0, m.role, m.text);
       const last = events.length ? events[events.length - 1].seq : from;
       db.prepare(`
-        INSERT INTO sessions(id, cwd, created, title, indexed_through, origin)
-        VALUES (?,?,?,?,?,?)
+        INSERT INTO sessions(id, cwd, created, title, indexed_through, origin, revision)
+        VALUES (?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
           title = COALESCE(excluded.title, sessions.title),
-          indexed_through = excluded.indexed_through
-      `).run(sessionId, header?.cwd ?? null, header?.createdAt ?? 0, title ?? null, last, header?.origin ?? null);
+          indexed_through = excluded.indexed_through,
+          revision = COALESCE(excluded.revision, sessions.revision)
+      `).run(
+        sessionId,
+        header?.cwd ?? null,
+        header?.createdAt ?? 0,
+        title ?? null,
+        last,
+        header?.origin ?? null,
+        revision ?? null
+      );
       db.exec('COMMIT');
     } catch (e) {
       db.exec('ROLLBACK');
       throw e;
     }
     return msgs.length;
+  }
+
+  async setRevision(sessionId, revision) {
+    if (!revision) return;
+    const db = await this.open();
+    db.prepare('UPDATE sessions SET revision=? WHERE id=?').run(revision, sessionId);
+  }
+
+  async sessionIndexState() {
+    const db = await this.open();
+    const rows = db.prepare('SELECT id, indexed_through, revision FROM sessions').all();
+    return new Map(rows.map((r) => [r.id, r]));
   }
 
   /**
@@ -474,31 +539,132 @@ export function registerSessionSearch(
 ) {
   const index = new SessionIndex(indexPath);
   const obelisk = new ObeliskBridge(obeliskDbPath);
-  const sq = () => ctx.get('sessionQuery');
+  const sq = () => ctx.get?.('sessionQuery');
+  const sp = () => ctx.get?.('sessionPersistence');
+  const sessionsSvc = () => ctx.get?.('sessions');
 
-  async function refresh(signal) {
-    const svc = sq();
-    if (!svc) return 0;
-    const records = await svc.listSessions(signal);
-    let added = 0;
-    for (const rec of records) {
-      const id = rec.header.id;
-      if (HIDDEN_ORIGINS.has(rec.header.origin)) continue;
-      const meta = await index.sessionMeta(id);
-      try {
-        const snap = await svc.readSession(id);
-        const lastSeq = snap.events.length ? snap.events[snap.events.length - 1].seq : -1;
-        if (meta && meta.indexed_through >= lastSeq) continue;
-        let title;
-        try {
-          title = (await svc.readTitle(id, signal))?.title;
-        } catch {}
-        added += await index.ingest(id, rec.header, snap.events, title);
-      } catch (e) {
-        log(`session_search ingest ${id} failed: ${e?.message || e}`);
+  function extractTitle(events) {
+    if (!Array.isArray(events) || !events.length) return undefined;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e?.type === 'session/title' && typeof e.data?.title === 'string') {
+        return e.data.title;
       }
     }
-    return added;
+    return undefined;
+  }
+
+  async function safeReadTitle(svc, id, signal) {
+    try {
+      return (await svc.readTitle?.(id, signal))?.title;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function ingestFromSource(svc, id, header, meta, knownRevision, signal) {
+    if (typeof svc.observeSession === 'function') {
+      const lease = await svc.observeSession(id, { signal, projectionMode: 'none' });
+      try {
+        const hdr = header ?? lease.header;
+        if (HIDDEN_ORIGINS.has(hdr?.origin)) return 0;
+        const lastSeq = typeof lease.cursor === 'number' ? lease.cursor : -1;
+        const rev = lease.revision ?? knownRevision ?? null;
+        if (meta && meta.indexed_through >= lastSeq) {
+          if (rev && meta.revision !== rev) await index.setRevision(id, rev);
+          return 0;
+        }
+        const events = lease.events;
+        const title = extractTitle(events) ?? (await safeReadTitle(svc, id, signal));
+        return await index.ingest(id, hdr, events, title, rev);
+      } finally {
+        lease?.[Symbol.dispose]?.();
+      }
+    }
+
+    const snap = await svc.readSession(id);
+    const hdr = header ?? snap.session;
+    if (HIDDEN_ORIGINS.has(hdr?.origin)) return 0;
+    const lastSeq = snap.events.length ? snap.events[snap.events.length - 1].seq : -1;
+    if (meta && meta.indexed_through >= lastSeq) {
+      if (knownRevision && meta.revision !== knownRevision) {
+        await index.setRevision(id, knownRevision);
+      }
+      return 0;
+    }
+    const title = extractTitle(snap.events) ?? (await safeReadTitle(svc, id, signal));
+    return await index.ingest(id, hdr, snap.events, title, knownRevision);
+  }
+
+  let inFlightRefresh = null;
+
+  async function refresh(signal) {
+    if (inFlightRefresh) return inFlightRefresh;
+    inFlightRefresh = (async () => {
+      const svc = sq();
+      if (!svc) return 0;
+      const records = await svc.listSessions(signal);
+      const stateMap = await index.sessionIndexState();
+
+      let revById = null;
+      const persistence = sp();
+      if (typeof persistence?.list === 'function') {
+        try {
+          const persisted = await persistence.list(signal ? { signal } : undefined);
+          revById = new Map(persisted.map((p) => [p.header.id, p.revision]));
+        } catch {}
+      }
+
+      let added = 0;
+      for (const rec of records) {
+        if (signal?.aborted) break;
+        const id = rec.header.id;
+        if (HIDDEN_ORIGINS.has(rec.header.origin)) continue;
+        const meta = stateMap.get(id);
+        const rev = revById?.get(id) ?? null;
+
+        // Fast skip: persisted session whose revision matches the already-indexed revision
+        if (!rec.live && meta && rev && meta.revision === rev) continue;
+
+        try {
+          added += await ingestFromSource(svc, id, rec.header, meta, rev, signal);
+        } catch (e) {
+          log(`session_search ingest ${id} failed: ${e?.message || e}`);
+        }
+      }
+      return added;
+    })();
+    try {
+      return await inFlightRefresh;
+    } finally {
+      inFlightRefresh = null;
+    }
+  }
+
+  async function refreshOne(sessionId, signal) {
+    const svc = sq();
+    if (!svc) return 0;
+    const meta = await index.sessionMeta(sessionId);
+    const isLive = Boolean(sessionsSvc()?.get?.(sessionId));
+    let knownRevision = null;
+
+    if (!isLive && meta?.revision) {
+      const persistence = sp();
+      if (typeof persistence?.stat === 'function') {
+        try {
+          const st = await persistence.stat(sessionId, signal ? { signal } : undefined);
+          knownRevision = st?.revision ?? null;
+          if (knownRevision && meta.revision === knownRevision) return 0;
+        } catch {}
+      }
+    }
+
+    try {
+      return await ingestFromSource(svc, sessionId, null, meta, knownRevision, signal);
+    } catch (e) {
+      log(`session_search ingest ${sessionId} failed: ${e?.message || e}`);
+      return 0;
+    }
   }
 
   const isObeliskId = (id) => String(id || '').includes(':');
@@ -572,11 +738,6 @@ export function registerSessionSearch(
         render: (_a, v) => [{ type: 'text', text: JSON.stringify(v, null, 1) }],
       },
       async execute(args, exec) {
-        try {
-          await refresh(exec?.signal);
-        } catch (e) {
-          log(`index refresh error: ${e?.message || e}`);
-        }
         const self = exec?.agent?.id;
 
         // Shape 1: SCROLL
@@ -585,6 +746,11 @@ export function registerSessionSearch(
           if (isObeliskId(args.session_id)) {
             msgs = await obelisk.messagesOf(args.session_id);
           } else {
+            try {
+              await refreshOne(args.session_id, exec?.signal);
+            } catch (e) {
+              log(`index refreshOne error: ${e?.message || e}`);
+            }
             msgs = await index.messagesOf(args.session_id);
           }
           if (!msgs.length) return { success: false, error: 'Session not found or has no messages' };
@@ -618,6 +784,11 @@ export function registerSessionSearch(
           if (isObeliskId(args.session_id)) {
             msgs = await obelisk.messagesOf(args.session_id);
           } else {
+            try {
+              await refreshOne(args.session_id, exec?.signal);
+            } catch (e) {
+              log(`index refreshOne error: ${e?.message || e}`);
+            }
             msgs = await index.messagesOf(args.session_id);
           }
           if (!msgs.length) return { success: false, error: 'Session not found or has no messages' };
@@ -645,6 +816,12 @@ export function registerSessionSearch(
               return item;
             }),
           });
+        }
+
+        try {
+          await refresh(exec?.signal);
+        } catch (e) {
+          log(`index refresh error: ${e?.message || e}`);
         }
 
         // Shape 3: BROWSE
