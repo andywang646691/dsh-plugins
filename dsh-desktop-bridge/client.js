@@ -104,11 +104,13 @@ function __dsh_desktop_bridge_factory(require) {
         ctx.remote.$on('approval/request', function(request, next) {
           const toolName = request.toolName || '工具';
           const reason = request.displayReason || request.reason || 'Agent 需要执行操作，请审批';
+          const sid = (ctx.sessions && typeof ctx.sessions.scopeOf === 'function' ? ctx.sessions.scopeOf(this) : null) || request.sessionId || null;
           sendNotification({
             id: 'approval-' + Date.now(),
             title: `等待审批: ${toolName}`,
             body: reason,
             action: 'approval.requested',
+            sessionId: sid,
           });
           // Continue waterfall chain to existing UI handlers
           return next();
@@ -118,16 +120,83 @@ function __dsh_desktop_bridge_factory(require) {
         ctx.remote.$on('user-questions/request', function(request, next) {
           const questions = request.questions || [];
           const qText = questions[0]?.question || 'Agent 提出了问题，需要您回复';
+          const sid = (ctx.sessions && typeof ctx.sessions.scopeOf === 'function' ? ctx.sessions.scopeOf(this) : null) || request.sessionId || null;
           sendNotification({
             id: 'question-' + Date.now(),
             title: '等待回复',
             body: qText,
             action: 'question.requested',
+            sessionId: sid,
           });
           // Continue waterfall chain to existing UI handlers
           return next();
         });
       }
+
+      // Navigate to a specific session in the UI (triggered by notification click or deep link)
+      function navigateToSession(sessionId) {
+        if (!sessionId) return false;
+        console.log('[@max/dsh-desktop-bridge] Navigating to session:', sessionId);
+
+        // 1. Try ctx.uiWorkspace.openSession(sessionId)
+        try {
+          var ws = null;
+          if (ctx.get && typeof ctx.get === 'function') ws = ctx.get('uiWorkspace');
+          if (!ws && ctx.uiWorkspace) ws = ctx.uiWorkspace;
+          if (ws && typeof ws.openSession === 'function') {
+            ws.openSession(sessionId);
+            checkAndClearSession(sessionId);
+            return true;
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] uiWorkspace.openSession error:', e);
+        }
+
+        // 2. Try ctx.sessions.open(sessionId)
+        try {
+          var sessSvc = null;
+          if (ctx.get && typeof ctx.get === 'function') sessSvc = ctx.get('sessions');
+          if (!sessSvc && ctx.sessions) sessSvc = ctx.sessions;
+          if (sessSvc && typeof sessSvc.open === 'function') {
+            sessSvc.open(sessionId);
+            checkAndClearSession(sessionId);
+            return true;
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] sessions.open error:', e);
+        }
+
+        // 3. Fallback: DOM click
+        try {
+          var row = document.querySelector(
+            `[data-row-key="session:${sessionId}"], [data-session-id="${sessionId}"]`
+          );
+          if (row) {
+            row.click();
+            checkAndClearSession(sessionId);
+            return true;
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] DOM click fallback error:', e);
+        }
+
+        return false;
+      }
+
+      // Register navigation callback with desktop bridge
+      var bridge = window.desktopBridge || window.mygo;
+      if (bridge && typeof bridge.onNavigateSession === 'function') {
+        bridge.onNavigateSession((sessionId) => {
+          navigateToSession(sessionId);
+        });
+      }
+
+      window.addEventListener('dsh:navigate-session', (e) => {
+        const sid = e.detail?.sessionId;
+        if (sid) {
+          navigateToSession(sid);
+        }
+      });
 
       // Clear completed badge when user selects/views a session
       function checkAndClearSession(sid) {
