@@ -1,0 +1,33 @@
+{
+  "name": "@max/dsh-desktop-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop bridge plugin for DSH Mac client: status sync, notification forwarding, and badge count",
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./logo": "./logo.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-modules"
+      ]
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --input-type=module -e 'import(\"./index.mjs\"); console.log(\"✔ @max/dsh-desktop-bridge syntax and import valid\")'"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@max/dsh-fast-search",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ultra-fast CJK & English full-text session search engine for DeepSeek Harness Web GUI and agents.",
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./icon": "./icon.svg",
+    "./logo": "./logo.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

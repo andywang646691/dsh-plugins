@@ -1,0 +1,3 @@
+- insert:
+    - id: dsh-fast-search
+      name: '@max/dsh-fast-search'

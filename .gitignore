@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Logs & Runtime
+*.log
+npm-debug.log*
+pnpm-debug.log*
+.cache/
+*.sqlite
+*.sqlite-*
+*.db
+.env
+.env.*

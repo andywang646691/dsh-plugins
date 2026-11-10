@@ -1,0 +1,29 @@
+{
+  "name": "@max/dsh-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Hermes-style memory and learning loop for DeepSeek Harness: bounded MEMORY.md/USER.md with a frozen per-session snapshot, memory and skill_manage tools, Skills-come-first guidance, background review, skill curator, and a Chinese-capable session_search.",
+  "type": "module",
+  "icon": "./icon.svg",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./icon": "./icon.svg",
+    "./logo": "./logo.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "bash test/run.sh"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1",
+    "yaml": "^2"
+  }
+}

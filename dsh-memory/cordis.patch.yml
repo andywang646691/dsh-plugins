@@ -1,0 +1,14 @@
+# @max/dsh-memory bundle: the plugin plus a dedicated skill-filesystem provider that scans ONLY the
+# agent skills root (/var/lib/dsh/agent-memory/skills), registered into the host's global skill layer.
+- insert:
+    - id: dsh-memory
+      name: '@max/dsh-memory'
+      config:
+        home: /var/lib/dsh/agent-memory
+    - id: dsh-memory-skills
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: '@max/dsh-memory'
+        includeDefaultRoots: false
+        customSkillDirs:
+          - /var/lib/dsh/agent-memory/skills

@@ -1,0 +1,4 @@
+# @max/dsh-desktop-bridge bundle patch
+- insert:
+    - id: dsh-desktop-bridge
+      name: '@max/dsh-desktop-bridge'

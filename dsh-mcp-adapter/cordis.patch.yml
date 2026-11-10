@@ -1,0 +1,9 @@
+# @max/dsh-mcp-adapter bundle patch
+- insert:
+    - id: mcp-adapter
+      name: '@max/dsh-mcp-adapter'
+      config:
+        prefix: 'mcp__'
+        stripMcpInstructions: true
+        serverDescriptions:
+          nexusdock: "操作我的电脑和 VPS 服务（当需要管理 Mac 本地或远程 Linux 服务器时使用）。"

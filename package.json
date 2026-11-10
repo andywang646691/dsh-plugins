@@ -1,0 +1,8 @@
+{
+  "name": "@max/dsh-plugins",
+  "private": true,
+  "description": "Max's DeepSeek Harness plugins monorepo",
+  "scripts": {
+    "test": "pnpm --filter \"@max/*\" test"
+  }
+}
