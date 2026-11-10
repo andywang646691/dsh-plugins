@@ -14,6 +14,150 @@ function __dsh_desktop_bridge_factory(require) {
       let lastSentRunning = null;
       let lastSentBadge = null;
 
+      // Extract raw text from message content blocks
+      function extractTextFromContent(content) {
+        if (!Array.isArray(content)) return '';
+        const parts = [];
+        for (const block of content) {
+          if (!block) continue;
+          if (block.type === 'text' && typeof block.text === 'string') {
+            parts.push(block.text);
+          }
+        }
+        return parts.join('\n');
+      }
+
+      // Find the last assistant reply text in a session event list
+      function extractLastAssistantReplyFromEvents(entries) {
+        if (!Array.isArray(entries)) return null;
+        for (let i = entries.length - 1; i >= 0; i--) {
+          const entry = entries[i];
+          const event = entry?.event || (entry?.type === 'assistant/message' ? entry : null);
+          if (event?.type === 'assistant/message' && event?.data?.message?.content) {
+            const text = extractTextFromContent(event.data.message.content);
+            if (text && text.trim().length > 0) {
+              return text.trim();
+            }
+          }
+        }
+        return null;
+      }
+
+      // Parse markdown export as fallback to find the last Assistant section
+      function extractLastAssistantReplyFromMarkdown(md) {
+        if (!md || typeof md !== 'string') return null;
+        const matches = [...md.matchAll(/\*\*Assistant\*\*\s*\n\n([\s\S]*?)(?=\n\n\*\*(?:Tool|Assistant|User)\b|\n\n<details>|$)/g)];
+        if (matches.length > 0) {
+          const lastMatch = matches[matches.length - 1][1];
+          if (lastMatch && lastMatch.trim()) {
+            return lastMatch.trim();
+          }
+        }
+        return null;
+      }
+
+      // Clean markdown, remove UI fences/reasoning, and truncate for native notification
+      function formatNotificationBody(replyText, sessionTitle) {
+        if (!replyText || typeof replyText !== 'string' || !replyText.trim()) {
+          return sessionTitle ? `会话 [${sessionTitle}] 的任务已完成` : '任务已完成';
+        }
+
+        let text = replyText;
+
+        // 1. Remove <think>...</think> block
+        text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+
+        // 2. Remove dsh-ui fences
+        text = text.replace(/```dsh-ui[\s\S]*?```/gi, '');
+
+        // 3. Condense code fences
+        text = text.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, (match, code) => {
+          const trimmed = code.trim();
+          return trimmed.length > 60 ? '[代码块]' : trimmed;
+        });
+
+        // 4. Remove images ![alt](url) -> alt
+        text = text.replace(/!\[(.*?)\]\(.*?\)/g, '$1');
+
+        // 5. Replace links [text](url) -> text
+        text = text.replace(/\[(.*?)\]\(.*?\)/g, '$1');
+
+        // 6. Remove bold/italic/strike
+        text = text.replace(/(\*\*|__)(.*?)\1/g, '$2');
+        text = text.replace(/(\*|_)(.*?)\1/g, '$2');
+        text = text.replace(/~~(.*?)~~/g, '$1');
+
+        // 7. Strip markdown headers (# ...), blockquotes (> ...), list bullets (- ...)
+        text = text.replace(/^#{1,6}\s+/gm, '');
+        text = text.replace(/^>\s+/gm, '');
+        text = text.replace(/^[\*\-]\s+/gm, '');
+
+        // 8. Normalize multiple newlines and spaces
+        text = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').replace(/[ \t]+/g, ' ').trim();
+
+        // 9. Truncate text (allowed to truncate for notification display, max 160 chars)
+        const MAX_BODY_LEN = 160;
+        if (text.length > MAX_BODY_LEN) {
+          text = text.slice(0, MAX_BODY_LEN).trim() + '...';
+        }
+
+        if (!text) {
+          return sessionTitle ? `会话 [${sessionTitle}] 的任务已完成` : '任务已完成';
+        }
+
+        return text;
+      }
+
+      // Resolve the latest assistant message for the session
+      async function resolveSessionReply(sid, sessionTitle) {
+        // 1. Try currently active in-memory binding
+        try {
+          const binding = ctx.sessions?.binding?.(sid);
+          if (binding && binding.eventSource) {
+            const entries = binding.eventSource.getSnapshot()?.entries;
+            const reply = extractLastAssistantReplyFromEvents(entries);
+            if (reply) {
+              return formatNotificationBody(reply, sessionTitle);
+            }
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] read from binding failed:', e);
+        }
+
+        // 2. Try host endpoint /desktop-bridge/last-reply
+        try {
+          const res = await fetch(`/desktop-bridge/last-reply?sessionId=${encodeURIComponent(sid)}`, {
+            credentials: 'same-origin',
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data && data.ok && data.reply) {
+              return formatNotificationBody(data.reply, sessionTitle);
+            }
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] fetch /desktop-bridge/last-reply error:', e);
+        }
+
+        // 3. Fallback: try /api/session.markdown
+        try {
+          const res = await fetch(`/api/session.markdown?sessionId=${encodeURIComponent(sid)}`, {
+            credentials: 'same-origin',
+          });
+          if (res.ok) {
+            const md = await res.text();
+            const reply = extractLastAssistantReplyFromMarkdown(md);
+            if (reply) {
+              return formatNotificationBody(reply, sessionTitle);
+            }
+          }
+        } catch (e) {
+          console.warn('[@max/dsh-desktop-bridge] fetch /api/session.markdown fallback error:', e);
+        }
+
+        return formatNotificationBody('', sessionTitle);
+      }
+
       function syncStateToDesktop(forceSync = false) {
         const snapshot = ctx.sessions?.list?.getSnapshot();
         if (!snapshot) return;
@@ -48,13 +192,28 @@ function __dsh_desktop_bridge_factory(require) {
                 completedSessions.add(sid);
               }
               const title = item.displayTitle || item.title || '会话';
-              sendNotification({
-                id: sid,
-                title: 'Agent 工作完成',
-                body: `会话 [${title}] 的任务已完成，请查看结果。`,
-                action: 'session.completed',
-                sessionId: sid,
-              });
+
+              // Small delay (150ms) to allow in-flight events and settlements to commit
+              setTimeout(() => {
+                resolveSessionReply(sid, title).then((bodyText) => {
+                  sendNotification({
+                    id: sid,
+                    title: title,
+                    body: bodyText,
+                    action: 'session.completed',
+                    sessionId: sid,
+                  });
+                }).catch((err) => {
+                  console.warn('[@max/dsh-desktop-bridge] resolveSessionReply error:', err);
+                  sendNotification({
+                    id: sid,
+                    title: title,
+                    body: `会话 [${title}] 的任务已完成，请查看结果。`,
+                    action: 'session.completed',
+                    sessionId: sid,
+                  });
+                });
+              }, 150);
             }
           }
 
