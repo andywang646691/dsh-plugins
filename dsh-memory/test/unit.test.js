@@ -154,6 +154,11 @@ test('skill_manage create / patch / write_file / atomic rollback / read-only out
   assert.match(m.apply([{ action: 'create', name: 'Bad_Name', content: SKILL('Bad_Name') }]).error, /kebab/);
   assert.match(m.apply([{ action: 'create', name: 'no-fm', content: 'body only' }]).error, /frontmatter/);
   assert.match(m.apply([{ action: 'write_file', name: 'demo-skill', file_path: '../escape.md', file_content: 'x' }]).error, /must/);
+  // description ceiling aligned to 500 chars (prevents silent truncation)
+  const longDescSkill = `---\nname: long-desc\ndescription: ${'x'.repeat(501)}\n---\n\n# long-desc\n\nBody.\n`;
+  assert.match(m.apply([{ action: 'create', name: 'long-desc', content: longDescSkill }]).error, /exceeds 500-char/);
+  const okDescSkill = `---\nname: ok-desc\ndescription: ${'x'.repeat(500)}\n---\n\n# ok-desc\n\nBody.\n`;
+  assert.equal(m.apply([{ action: 'create', name: 'ok-desc', content: okDescSkill }]).success, true);
   assert.equal(usage.load()['demo-skill'].created_by, 'user');
 });
 

@@ -7,7 +7,7 @@ import { parse as parseYaml } from 'yaml';
 import { fuzzyFindAndReplace } from './fuzzy.js';
 
 export const MAX_NAME_LENGTH = 64;
-export const MAX_DESCRIPTION_LENGTH = 1024;
+export const MAX_DESCRIPTION_LENGTH = 500; // aligned with DSH catalog display ceiling (DEFAULT_CATALOG_DESCRIPTION_MAX_LENGTH)
 export const MAX_SKILL_CONTENT_CHARS = 100_000;
 export const MAX_SKILL_FILE_BYTES = 1_048_576;
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/; // DSH skill-name grammar (stricter than Hermes)
@@ -60,7 +60,9 @@ export function validateSkillMd(content, expectedName) {
   for (const f of ['name', 'description']) if (!(f in fm.data)) return `Frontmatter must include '${f}' field.`;
   if (String(fm.data.name) !== expectedName) return `Frontmatter name '${fm.data.name}' must equal the skill name '${expectedName}'.`;
   const desc = String(fm.data.description);
-  if (desc.length > MAX_DESCRIPTION_LENGTH) return `Description exceeds ${MAX_DESCRIPTION_LENGTH} characters.`;
+  if (desc.length > MAX_DESCRIPTION_LENGTH) {
+    return `Description is ${desc.length} chars (exceeds ${MAX_DESCRIPTION_LENGTH}-char DSH catalog display ceiling). To prevent silent truncation of routing triggers in the skill catalog, descriptions must be ≤ ${MAX_DESCRIPTION_LENGTH} chars. Move detail into the skill body or references/.`;
+  }
   if (!fm.body.trim()) return 'SKILL.md must have a body after the frontmatter.';
   return null;
 }
