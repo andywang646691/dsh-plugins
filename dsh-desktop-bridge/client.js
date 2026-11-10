@@ -56,56 +56,113 @@ function __dsh_desktop_bridge_factory(require) {
         return null;
       }
 
-      // Clean markdown, remove UI fences/reasoning, and truncate for native notification
+      // Clean markdown, parse dsh-ui semantics at block-level, and format for native notification
       function formatNotificationBody(replyText, sessionTitle) {
         if (!replyText || typeof replyText !== 'string' || !replyText.trim()) {
           return sessionTitle ? `会话 [${sessionTitle}] 的任务已完成` : '任务已完成';
         }
 
-        let text = replyText;
-
         // 1. Remove <think>...</think> block
-        text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+        let text = replyText.replace(/<think>[\s\S]*?<\/think>/gi, '');
 
-        // 2. Remove dsh-ui fences
-        text = text.replace(/```dsh-ui[\s\S]*?```/gi, '');
+        // 2. Block-level parsing to cleanly isolate dsh-ui fences and extract UI semantics
+        let uiSummary = '';
+        const lines = text.replace(/\r\n/g, '\n').split('\n');
+        const filteredLines = [];
+        let inDshUi = false;
+        let dshUiBuffer = [];
+        let inCodeBlock = false;
 
-        // 3. Condense code fences
-        text = text.replace(/```[a-zA-Z0-9_-]*\n([\s\S]*?)```/g, (match, code) => {
-          const trimmed = code.trim();
-          return trimmed.length > 60 ? '[代码块]' : trimmed;
-        });
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const trimmed = line.trim();
 
-        // 4. Remove images ![alt](url) -> alt
-        text = text.replace(/!\[(.*?)\]\(.*?\)/g, '$1');
+          if (!inDshUi && !inCodeBlock && /^```dsh-ui\b/.test(trimmed)) {
+            inDshUi = true;
+            dshUiBuffer = [];
+            continue;
+          }
 
-        // 5. Replace links [text](url) -> text
-        text = text.replace(/\[(.*?)\]\(.*?\)/g, '$1');
+          if (inDshUi) {
+            if (trimmed === '```') {
+              inDshUi = false;
+              try {
+                const spec = JSON.parse(dshUiBuffer.join('\n'));
+                if (spec && typeof spec === 'object') {
+                  const specTitle = spec.title ? `[${spec.title}] ` : '';
+                  let core = '';
+                  const items = spec.items || [];
+                  for (const it of items) {
+                    if (it.type === 'callout' && it.content) {
+                      core = it.content;
+                      break;
+                    } else if (it.type === 'text' && it.content) {
+                      core = it.content;
+                      break;
+                    } else if (it.type === 'steps' && Array.isArray(it.steps) && it.steps.length > 0) {
+                      core = it.steps.map(s => s.title).filter(Boolean).slice(0, 3).join(' → ');
+                      break;
+                    }
+                  }
+                  if (!core && items.length > 0 && items[0]?.label) {
+                    core = items[0].label;
+                  }
+                  uiSummary = `${specTitle}${core}`.trim();
+                }
+              } catch (e) {}
+              dshUiBuffer = [];
+              continue;
+            } else {
+              dshUiBuffer.push(line);
+              continue;
+            }
+          }
 
-        // 6. Remove bold/italic/strike
-        text = text.replace(/(\*\*|__)(.*?)\1/g, '$2');
-        text = text.replace(/(\*|_)(.*?)\1/g, '$2');
-        text = text.replace(/~~(.*?)~~/g, '$1');
+          if (!inDshUi && /^```[a-zA-Z0-9_-]*$/.test(trimmed)) {
+            inCodeBlock = !inCodeBlock;
+            filteredLines.push('[代码块]');
+            continue;
+          }
 
-        // 7. Strip markdown headers (# ...), blockquotes (> ...), list bullets (- ...)
-        text = text.replace(/^#{1,6}\s+/gm, '');
-        text = text.replace(/^>\s+/gm, '');
-        text = text.replace(/^[\*\-]\s+/gm, '');
+          if (inCodeBlock) continue;
 
-        // 8. Normalize multiple newlines and spaces
-        text = text.replace(/\r\n/g, '\n').replace(/\n{2,}/g, '\n').replace(/[ \t]+/g, ' ').trim();
-
-        // 9. Truncate text (allowed to truncate for notification display, max 160 chars)
-        const MAX_BODY_LEN = 160;
-        if (text.length > MAX_BODY_LEN) {
-          text = text.slice(0, MAX_BODY_LEN).trim() + '...';
+          filteredLines.push(line);
         }
 
-        if (!text) {
+        let prose = filteredLines.join('\n');
+
+        // 3. Clean Markdown formatting
+        prose = prose.replace(/!\[(.*?)\]\(.*?\)/g, '$1');
+        prose = prose.replace(/\[(.*?)\]\(.*?\)/g, '$1');
+        prose = prose.replace(/(\*\*|__)(.*?)\1/g, '$2');
+        prose = prose.replace(/(\*|_)(.*?)\1/g, '$2');
+        prose = prose.replace(/~~(.*?)~~/g, '$1');
+        prose = prose.replace(/^#{1,6}\s+/gm, '');
+        prose = prose.replace(/^>\s+/gm, '');
+        prose = prose.replace(/^[\*\-]\s+/gm, '');
+        prose = prose.replace(/\s+/g, ' ').trim();
+
+        // 4. Combine UI summary and prose
+        let finalBody = '';
+        if (uiSummary && prose) {
+          finalBody = prose.length > 30 ? prose : `${uiSummary} · ${prose}`;
+        } else {
+          finalBody = prose || uiSummary;
+        }
+
+        // 5. Clean orphan punctuation / residual quotes
+        finalBody = finalBody.replace(/^[\s,."'\`]+|[\s,."'\`]+$/g, '').trim();
+
+        const MAX_BODY_LEN = 160;
+        if (finalBody.length > MAX_BODY_LEN) {
+          finalBody = finalBody.slice(0, MAX_BODY_LEN).trim() + '...';
+        }
+
+        if (!finalBody) {
           return sessionTitle ? `会话 [${sessionTitle}] 的任务已完成` : '任务已完成';
         }
 
-        return text;
+        return finalBody;
       }
 
       // Resolve the latest assistant message for the session
