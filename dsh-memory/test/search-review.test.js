@@ -410,7 +410,7 @@ test('session_search skips full-corpus refresh on scroll/read and skips unchange
     },
   };
 
-  registerSessionSearch(mockCtx, { indexPath: ':memory:', obeliskDbPath: null });
+  registerSessionSearch(mockCtx, { indexPath: ':memory:' });
   assert.ok(registeredTool);
 
   // 1. Discovery runs initial full refresh (2 observes)

@@ -1,5 +1,5 @@
 // Session Search Tool — Deep integration of Hermes 4-shape ergonomics and CJK routing
-// with Obelisk's multi-agent historical intelligence.
+// for DSH native sessions.
 //
 // 1. Shapes (Hermes):
 //    - DISCOVERY (query): Ranked sessions with best-match excerpt (+ opening/closing for #1)
@@ -10,13 +10,10 @@
 // 2. Search Engine:
 //    - Local DSH: SQLite FTS5 (tokenize='trigram') for CJK substrings, with LIKE fallback
 //      for <3 character terms and OR-relaxed retry when exact multi-term search misses.
-//    - Multi-Agent Bridge: Reads Obelisk's database (~/.obelisk/obelisk.sqlite) when present,
-//      transparently surfacing past conversations from Claude Code, Codex, Kimi, etc.
 //    - Zero LLM calls: All operations run pure SQLite queries for sub-10ms response.
 
 import { mkdirSync, existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
+import { dirname } from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 
 const DISCOVERY_SNIPPET = 1200;
@@ -342,150 +339,6 @@ export class SessionIndex {
   }
 }
 
-/**
- * Obelisk Historical Bridge: Queries ~/.obelisk/obelisk.sqlite for multi-agent history
- */
-class ObeliskBridge {
-  constructor(dbPath) {
-    this.path = dbPath;
-    this.db = null;
-  }
-
-  async open() {
-    if (this.db) return this.db;
-    if (!this.path || !existsSync(this.path)) return null;
-    try {
-      const { DatabaseSync } = await import('node:sqlite');
-      this.db = new DatabaseSync(this.path, { readOnly: true });
-      return this.db;
-    } catch {
-      return null;
-    }
-  }
-
-  async search(query, { limit = 3, after, before, sort } = {}) {
-    const db = await this.open();
-    if (!db) return [];
-    const rawTokens = query.trim().split(/\s+/).filter(Boolean);
-    if (!rawTokens.length) return [];
-
-    const isCjk = containsCjk(query);
-    const params = [];
-    let sql;
-
-    if (!isCjk) {
-      // FTS5 MATCH for ASCII
-      const matchText = rawTokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(' AND ');
-      sql = `
-        SELECT m.session_id, m.uuid as seq, m.role, m.text, m.timestamp as time,
-               s.title, s.project_path as cwd, COALESCE(s.source, m.source, 'agent') as source,
-               mf.rank
-        FROM messages_fts mf
-        JOIN messages m ON m.uuid = mf.uuid
-        LEFT JOIN sessions s ON s.id = m.session_id
-        WHERE mf.text MATCH ? AND COALESCE(m.is_meta, 0) = 0
-      `;
-      params.push(matchText);
-    } else {
-      // LIKE query for CJK to ensure 100% precision on Chinese tokens
-      const likes = rawTokens.map(() => "(m.text LIKE ? ESCAPE '\\' OR s.title LIKE ? ESCAPE '\\')").join(' AND ');
-      sql = `
-        SELECT m.session_id, m.uuid as seq, m.role, m.text, m.timestamp as time,
-               s.title, s.project_path as cwd, COALESCE(s.source, m.source, 'agent') as source,
-               0 as rank
-        FROM messages m
-        LEFT JOIN sessions s ON s.id = m.session_id
-        WHERE ${likes} AND COALESCE(m.is_meta, 0) = 0
-      `;
-      for (const t of rawTokens) {
-        const p = `%${escapeLike(t)}%`;
-        params.push(p, p);
-      }
-    }
-
-    if (after) {
-      sql += ' AND m.timestamp >= ?';
-      params.push(new Date(after).toISOString());
-    }
-    if (before) {
-      sql += ' AND m.timestamp <= ?';
-      params.push(new Date(before).toISOString());
-    }
-
-    sql += isCjk ? ' ORDER BY m.timestamp DESC LIMIT 100' : ' ORDER BY mf.rank, m.timestamp DESC LIMIT 100';
-
-    try {
-      const rows = db.prepare(sql).all(...params);
-      const bySession = new Map();
-      for (const r of rows) {
-        const cur = bySession.get(r.session_id);
-        if (!cur) {
-          bySession.set(r.session_id, { ...r, hits: 1 });
-        } else {
-          cur.hits++;
-        }
-      }
-      let ranked = [...bySession.values()];
-      if (sort === 'newest') ranked.sort((a, b) => (b.time > a.time ? 1 : -1));
-      else if (sort === 'oldest') ranked.sort((a, b) => (a.time > b.time ? 1 : -1));
-      return ranked.slice(0, limit);
-    } catch {
-      return [];
-    }
-  }
-
-  async messagesOf(sessionId) {
-    const db = await this.open();
-    if (!db) return [];
-    try {
-      return db
-        .prepare(`
-          SELECT uuid as id, role, timestamp as time, text
-          FROM messages
-          WHERE session_id = ? AND COALESCE(is_meta, 0) = 0
-          ORDER BY timestamp ASC, rowid ASC
-        `)
-        .all(sessionId);
-    } catch {
-      return [];
-    }
-  }
-
-  async sessionMeta(sessionId) {
-    const db = await this.open();
-    if (!db) return null;
-    try {
-      return db
-        .prepare(`
-          SELECT id as session_id, title, project_path as cwd, started_at as started, source
-          FROM sessions
-          WHERE id = ?
-        `)
-        .get(sessionId);
-    } catch {
-      return null;
-    }
-  }
-
-  async recent(limit) {
-    const db = await this.open();
-    if (!db) return [];
-    try {
-      return db
-        .prepare(`
-          SELECT s.id as session_id, s.title, s.started_at as started, s.ended_at as last_time, s.source,
-                 (SELECT text FROM messages m WHERE m.session_id = s.id AND role = 'user' ORDER BY timestamp ASC LIMIT 1) as first_prompt
-          FROM sessions s
-          ORDER BY COALESCE(s.ended_at, s.started_at) DESC
-          LIMIT ?
-        `)
-        .all(limit);
-    } catch {
-      return [];
-    }
-  }
-}
-
 const RELATIVE = /^(\d+)\s*(h|d|w)$/i;
 function bound(v) {
   if (!v) return undefined;
@@ -496,16 +349,6 @@ function bound(v) {
   }
   const t = Date.parse(v);
   return Number.isFinite(t) ? t : undefined;
-}
-
-function resolveObeliskDbPath() {
-  const custom = process.env.OBELISK_DB_PATH;
-  if (custom && existsSync(custom)) return custom;
-  const p1 = '/var/lib/dsh/.obelisk/obelisk.sqlite';
-  if (existsSync(p1)) return p1;
-  const p2 = join(homedir(), '.obelisk', 'obelisk.sqlite');
-  if (existsSync(p2)) return p2;
-  return null;
 }
 
 export function cleanJson(val) {
@@ -534,11 +377,9 @@ export function registerSessionSearch(
     indexPath,
     log = () => {},
     register = (d) => ctx.tools.register(d),
-    obeliskDbPath = resolveObeliskDbPath(),
   } = {}
 ) {
   const index = new SessionIndex(indexPath);
-  const obelisk = new ObeliskBridge(obeliskDbPath);
   const sq = () => ctx.get?.('sessionQuery');
   const sp = () => ctx.get?.('sessionPersistence');
   const sessionsSvc = () => ctx.get?.('sessions');
@@ -667,18 +508,15 @@ export function registerSessionSearch(
     }
   }
 
-  const isObeliskId = (id) => String(id || '').includes(':');
-
   const fmtSession = async (id) => {
-    const isOb = isObeliskId(id);
-    const m = isOb ? await obelisk.sessionMeta(id) : await index.sessionMeta(id);
+    const m = await index.sessionMeta(id);
     const res = {
       session_id: id,
-      source: (isOb ? m?.source : null) || (isOb ? 'obelisk' : 'dsh'),
+      source: 'dsh',
     };
     if (m?.title) res.title = m.title;
     if (m?.cwd) res.cwd = m.cwd;
-    const st = isOb ? iso(m?.started) : iso(m?.created);
+    const st = iso(m?.created);
     if (st) res.started = st;
     return res;
   };
@@ -687,9 +525,9 @@ export function registerSessionSearch(
     defineTool({
       name: 'session_search',
       description:
-        "Search or read past DSH and multi-agent conversations (full-text, Chinese-capable), or scroll inside one. " +
+        "Search or read past DSH conversations (full-text, Chinese-capable), or scroll inside one. " +
         "Four shapes, picked by args:\n" +
-        "- `query`: Discovery (top matching sessions across DSH and multi-agent history with best-matching message; #1 result includes opening and closing messages);\n" +
+        "- `query`: Discovery (top matching sessions across DSH history with best-matching message; #1 result includes opening and closing messages);\n" +
         "- `session_id` + `around_message_id`: Scroll (window of messages around an anchor);\n" +
         "- `session_id` alone: Read whole session (head/tail);\n" +
         "- no args: Browse recent sessions.\n" +
@@ -722,11 +560,11 @@ export function registerSessionSearch(
         },
         session_id: {
           type: 'string',
-          description: 'Read (alone) or scroll (with around_message_id) inside this session (supports both DSH and Obelisk IDs).',
+          description: 'Read (alone) or scroll (with around_message_id) inside this session.',
         },
         around_message_id: {
           type: 'string',
-          description: 'Scroll anchor: the message id (integer seq or string UUID) returned by discovery.',
+          description: 'Scroll anchor: the message id (integer seq) returned by discovery.',
         },
         window: {
           type: 'integer',
@@ -742,17 +580,12 @@ export function registerSessionSearch(
 
         // Shape 1: SCROLL
         if (args.session_id && args.around_message_id !== undefined) {
-          let msgs = [];
-          if (isObeliskId(args.session_id)) {
-            msgs = await obelisk.messagesOf(args.session_id);
-          } else {
-            try {
-              await refreshOne(args.session_id, exec?.signal);
-            } catch (e) {
-              log(`index refreshOne error: ${e?.message || e}`);
-            }
-            msgs = await index.messagesOf(args.session_id);
+          try {
+            await refreshOne(args.session_id, exec?.signal);
+          } catch (e) {
+            log(`index refreshOne error: ${e?.message || e}`);
           }
+          const msgs = await index.messagesOf(args.session_id);
           if (!msgs.length) return { success: false, error: 'Session not found or has no messages' };
 
           const target = String(args.around_message_id);
@@ -780,17 +613,12 @@ export function registerSessionSearch(
 
         // Shape 2: READ
         if (args.session_id) {
-          let msgs = [];
-          if (isObeliskId(args.session_id)) {
-            msgs = await obelisk.messagesOf(args.session_id);
-          } else {
-            try {
-              await refreshOne(args.session_id, exec?.signal);
-            } catch (e) {
-              log(`index refreshOne error: ${e?.message || e}`);
-            }
-            msgs = await index.messagesOf(args.session_id);
+          try {
+            await refreshOne(args.session_id, exec?.signal);
+          } catch (e) {
+            log(`index refreshOne error: ${e?.message || e}`);
           }
+          const msgs = await index.messagesOf(args.session_id);
           if (!msgs.length) return { success: false, error: 'Session not found or has no messages' };
 
           const pick = msgs.length > 20 ? [...msgs.slice(0, 10), null, ...msgs.slice(-10)] : msgs;
@@ -828,39 +656,24 @@ export function registerSessionSearch(
         if (!args.query || !args.query.trim()) {
           const limit = Math.min(Math.max(args.limit ?? 10, 1), 10);
           const dshRows = await index.recent(limit, self);
-          const obeliskRows = await obelisk.recent(limit);
 
-          // Merge & sort recent sessions
-          const combined = [
-            ...dshRows.map((r) => {
-              const item = {
-                session_id: r.id,
-                source: 'dsh',
-                first_prompt: clip(r.first_prompt || '', 200),
-              };
-              if (r.title) item.title = r.title;
-              const t = iso(r.last_time);
-              if (t) item.last_active = t;
-              return item;
-            }),
-            ...obeliskRows.map((r) => {
-              const item = {
-                session_id: r.session_id,
-                source: r.source || 'obelisk',
-                first_prompt: clip(r.first_prompt || '', 200),
-              };
-              if (r.title) item.title = r.title;
-              const t = iso(r.last_time || r.started);
-              if (t) item.last_active = t;
-              return item;
-            }),
-          ];
+          const sessions = dshRows.map((r) => {
+            const item = {
+              session_id: r.id,
+              source: 'dsh',
+              first_prompt: clip(r.first_prompt || '', 200),
+            };
+            if (r.title) item.title = r.title;
+            const t = iso(r.last_time);
+            if (t) item.last_active = t;
+            return item;
+          });
 
-          combined.sort((a, b) => String(b.last_active || '').localeCompare(String(a.last_active || '')));
+          sessions.sort((a, b) => String(b.last_active || '').localeCompare(String(a.last_active || '')));
           return cleanJson({
             success: true,
             shape: 'browse',
-            sessions: combined.slice(0, limit),
+            sessions: sessions.slice(0, limit),
           });
         }
 
@@ -874,24 +687,8 @@ export function registerSessionSearch(
           sort: args.sort,
         };
 
-        // Query DSH index first
         const localHits = await index.search(args.query, searchOpts);
-        let hits = [...localHits];
-
-        // If hits fewer than limit, or searching broadly, query Obelisk
-        if (hits.length < limit) {
-          const obeliskHits = await obelisk.search(args.query, {
-            ...searchOpts,
-            limit: limit - hits.length + 2,
-          });
-          const existingIds = new Set(hits.map((h) => h.session_id));
-          for (const oh of obeliskHits) {
-            if (!existingIds.has(oh.session_id)) {
-              hits.push(oh);
-              existingIds.add(oh.session_id);
-            }
-          }
-        }
+        const hits = [...localHits];
 
         const results = [];
         for (const [i, h] of hits.slice(0, limit).entries()) {
@@ -908,12 +705,7 @@ export function registerSessionSearch(
 
           // Hydrate opening & closing messages for the #1 top result
           if (i === 0) {
-            let msgs = [];
-            if (isObeliskId(h.session_id)) {
-              msgs = await obelisk.messagesOf(h.session_id);
-            } else {
-              msgs = await index.messagesOf(h.session_id);
-            }
+            const msgs = await index.messagesOf(h.session_id);
             if (msgs.length) {
               r.opening = msgs.slice(0, 2).map((m) => ({
                 id: m.id ?? m.seq,
